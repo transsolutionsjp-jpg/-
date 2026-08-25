@@ -57,6 +57,23 @@ RemoteEvent を追加しないこと（仕様書 12. 禁止事項）。
 
 ## Roblox Studio で動かす
 
+初回は `install/` の3ファイルを Studio に読み込むのが早い。
+手順は [`docs/SETUP.md`](docs/SETUP.md) を参照。
+
+| 順 | 右クリックする場所 | 選ぶファイル |
+|---|---|---|
+| 1 | `ReplicatedStorage` | `install/1_ReplicatedStorage.rbxmx` |
+| 2 | `ServerScriptService` | `install/2_ServerScriptService.rbxmx` |
+| 3 | `StarterPlayer` > `StarterPlayerScripts` | `install/3_StarterPlayerScripts.rbxmx` |
+
+`install/` は `src/` から生成したもの。`src/` を変更したら作り直す。
+
+```bash
+python3 tools/build_install.py
+```
+
+### 継続開発では Rojo を使う
+
 [Rojo](https://rojo.space/) を使う。
 
 ```bash

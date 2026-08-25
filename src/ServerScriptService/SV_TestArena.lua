@@ -163,6 +163,25 @@ local function buildBoundary(parent: Instance)
 	end
 end
 
+--==================================================
+-- Studio 初期状態の片付け
+--==================================================
+-- 新規プレイスに最初から入っている Baseplate と SpawnLocation を消す。
+-- 残しておくと、こちらのスポーン地点と競合してプレイヤーが
+-- 中央に湧いてしまう。手作業で消させないためにコード側で処理する。
+local function clearDefaults(keep: Instance)
+	for _, child in ipairs(workspace:GetChildren()) do
+		if child == keep then
+			continue
+		end
+		if child.Name == "Baseplate" and child:IsA("BasePart") then
+			child:Destroy()
+		elseif child:IsA("SpawnLocation") then
+			child:Destroy()
+		end
+	end
+end
+
 function Arena.Build()
 	if not Config.TestArena.Enabled then
 		return
@@ -176,6 +195,8 @@ function Arena.Build()
 	local folder = Instance.new("Folder")
 	folder.Name = "TestArena"
 	folder.Parent = workspace
+
+	clearDefaults(folder)
 
 	buildFloor(folder)
 	buildSpawns(folder)

@@ -1,0 +1,975 @@
+<roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://www.roblox.com/roblox.xsd" version="4">
+	<Item class="ModuleScript" referent="RBX0">
+		<Properties>
+			<bool name="Disabled">false</bool>
+			<string name="Name">SV_Net</string>
+			<ProtectedString name="Source"><![CDATA[--!nonstrict
+--[[
+	SV_Net
+	配置場所: ServerScriptService/SV_Net
+
+	RemoteEvent の生成と取得のみを担当する。
+	命名規則: RE_動詞_名詞
+
+	【厳守】
+	クライアントからダメージ値・体力値を受け取る RemoteEvent を追加しないこと。
+	クライアントが送ってよいのは「撃ちたい」「リロードしたい」という意思のみ。
+]]
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local Net = {}
+
+-- クライアント → サーバー（意思のみ。数値結果は一切受け取らない）
+local C2S = {
+	"RE_Fire_Weapon",   -- 引数: 照準点(Vector3)。ダメージも命中も送らせない
+	"RE_Reload_Weapon", -- 引数: なし
+}
+
+-- サーバー → クライアント（確定した結果のみ）
+local S2C = {
+	"RE_Sync_State",  -- 体力・弾薬・リロード状態
+	"RE_Notify_Hit",  -- ヒットマーカー（撃った本人にのみ送る）
+	"RE_Notify_Shot", -- 曳光弾の描画（全員に送る）
+	"RE_Notify_Death",-- 死亡通知
+}
+
+local folder = ReplicatedStorage:FindFirstChild("Remotes")
+if not folder then
+	folder = Instance.new("Folder")
+	folder.Name = "Remotes"
+	folder.Parent = ReplicatedStorage
+end
+
+local function ensure(name: string): RemoteEvent
+	local existing = folder:FindFirstChild(name)
+	if existing then
+		return existing
+	end
+	local re = Instance.new("RemoteEvent")
+	re.Name = name
+	re.Parent = folder
+	return re
+end
+
+for _, name in ipairs(C2S) do ensure(name) end
+for _, name in ipairs(S2C) do ensure(name) end
+
+function Net.Get(name: string): RemoteEvent
+	local re = folder:FindFirstChild(name)
+	assert(re, ("SV_Net: RemoteEvent '%s' が存在しません"):format(name))
+	return re
+end
+
+return Net
+]]></ProtectedString>
+		</Properties>
+	</Item>
+	<Item class="ModuleScript" referent="RBX1">
+		<Properties>
+			<bool name="Disabled">false</bool>
+			<string name="Name">SV_State</string>
+			<ProtectedString name="Source"><![CDATA[--!nonstrict
+--[[
+	SV_State
+	配置場所: ServerScriptService/SV_State
+
+	プレイヤーごとの権威状態を保持する。サーバーのみが書き換える。
+
+	体力について:
+	体力は Humanoid.Health をそのまま「単一リソース」として使う。
+	装備コスト・使用コスト・維持コスト・被弾ダメージは全てここから引かれる。
+	（仕様書 2. 体力（単一リソース））
+]]
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Config = require(ReplicatedStorage:WaitForChild("GameConfig"))
+
+local State = {}
+
+local store: { [Player]: any } = {}
+
+-- 段階1では武器1種のみ。ライン切替は段階4.5で汎用処理として実装する
+function State.Create(player: Player, weaponName: string)
+	local weapon = Config.Weapons[weaponName]
+	assert(weapon, ("SV_State: 未定義の武器 '%s'"):format(weaponName))
+
+	local magSize = weapon.MagSize or 0
+	local mags = weapon.Mags or 1
+
+	local st = {
+		Alive          = true,
+
+		WeaponName     = weaponName,
+		Ammo           = magSize,
+		Reserve        = math.max(0, (mags - 1) * magSize),
+		LastFireAt     = 0,
+		ReloadingUntil = 0,
+
+		-- 継続ダメージ（段階1.7）
+		BleedUntil     = 0,
+		BleedNextTickAt= 0,
+
+		-- 撃破点の帰属に使う（段階3で得点集計から参照する）
+		DamageLog      = {} :: { [number]: number }, -- UserId -> 累計ダメージ
+		LastAttackerId = nil :: number?,
+		DiedByBleed    = false,
+	}
+
+	store[player] = st
+	return st
+end
+
+function State.Get(player: Player)
+	return store[player]
+end
+
+function State.Remove(player: Player)
+	store[player] = nil
+end
+
+function State.All()
+	return store
+end
+
+-- 与ダメージの記録。継続ダメージ死亡時の最多ダメージ判定に使う
+function State.LogDamage(st, attackerId: number?, amount: number)
+	if not attackerId then
+		return
+	end
+	st.DamageLog[attackerId] = (st.DamageLog[attackerId] or 0) + amount
+end
+
+-- 最も多くダメージを与えた者の UserId を返す
+function State.MostDamageId(st): number?
+	local bestId, bestAmount = nil, 0
+	for id, amount in pairs(st.DamageLog) do
+		if amount > bestAmount then
+			bestId, bestAmount = id, amount
+		end
+	end
+	return bestId
+end
+
+return State
+]]></ProtectedString>
+		</Properties>
+	</Item>
+	<Item class="ModuleScript" referent="RBX2">
+		<Properties>
+			<bool name="Disabled">false</bool>
+			<string name="Name">SV_Character</string>
+			<ProtectedString name="Source"><![CDATA[--!nonstrict
+--[[
+	SV_Character
+	配置場所: ServerScriptService/SV_Character
+
+	キャラクターの生成と、移動・体力の初期設定を担当する。
+
+	【段階1の注意（仕様書 13.）】
+	基本ジャンプ高1.9mと空中ペナルティを最初から入れること。
+	後付けすると全ての操作感が変わり、それまでの調整が無駄になる。
+]]
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local Config = require(ReplicatedStorage:WaitForChild("GameConfig"))
+local State = require(script.Parent.SV_State)
+
+local Character = {}
+
+--==================================================
+-- 最大体力（装備コスト）
+--==================================================
+-- 枠コストは「装備したスロット数」に応じて最大体力から減算される。
+-- 段階1は武器1種のみ＝1スロット＝SlotCost[1]=0 なので減算なし。
+function Character.MaxHealthForSlots(slotCount: number): number
+	local total = 0
+	for i = 1, math.min(slotCount, #Config.SlotCost) do
+		total += Config.SlotCost[i]
+	end
+	return math.max(1, Config.Health.Max - total)
+end
+
+--==================================================
+-- 空中判定（サーバー側で確定する）
+--==================================================
+-- 通常ジャンプ・空中ジャンプ・落下中を問わず接地していなければ空中。
+-- 仕様書 7. 空中状態の共通ルール（削除禁止）
+function Character.IsAirborne(humanoid: Humanoid): boolean
+	local s = humanoid:GetState()
+	return s == Enum.HumanoidStateType.Freefall
+		or s == Enum.HumanoidStateType.Jumping
+		or s == Enum.HumanoidStateType.FallingDown
+end
+
+--==================================================
+-- 体力の自動回復を止める
+--==================================================
+-- Roblox が挿入する Health スクリプトを削除する。
+-- 仕様書 2.「試合中の回復なし」
+local function killRegen(character: Model)
+	local existing = character:FindFirstChild("Health")
+	if existing and existing:IsA("BaseScript") then
+		existing:Destroy()
+	end
+	-- 後から挿入される場合に備えて短時間だけ監視する
+	local conn
+	conn = character.ChildAdded:Connect(function(child)
+		if child.Name == "Health" and child:IsA("BaseScript") then
+			child:Destroy()
+		end
+	end)
+	task.delay(5, function()
+		if conn then conn:Disconnect() end
+	end)
+end
+
+--==================================================
+-- 移動設定の適用
+--==================================================
+local function applyMovement(humanoid: Humanoid, weaponName: string)
+	local weapon = Config.Weapons[weaponName]
+	local moveMul = (weapon and weapon.MoveSpeedMul) or 1.0
+
+	humanoid.WalkSpeed = Config.M(Config.Movement.WalkSpeedMps) * moveMul
+
+	-- JumpPower ではなく JumpHeight を使う。仕様が高さ(m)で定義されているため
+	humanoid.UseJumpPower = false
+	humanoid.JumpHeight = Config.M(Config.Movement.BaseJumpHeightM)
+end
+
+--==================================================
+-- 着地後の再ジャンプ待機
+--==================================================
+local function applyJumpCooldown(humanoid: Humanoid)
+	local baseHeight = Config.M(Config.Movement.BaseJumpHeightM)
+
+	humanoid.StateChanged:Connect(function(_, newState)
+		if newState ~= Enum.HumanoidStateType.Landed then
+			return
+		end
+		humanoid.JumpHeight = 0
+		task.delay(Config.Movement.JumpCooldownSec, function()
+			if humanoid.Parent and humanoid.Health > 0 then
+				humanoid.JumpHeight = baseHeight
+			end
+		end)
+	end)
+end
+
+--==================================================
+-- 初期化
+--==================================================
+function Character.Setup(player: Player, character: Model)
+	local humanoid = character:WaitForChild("Humanoid") :: Humanoid
+
+	killRegen(character)
+
+	local st = State.Get(player)
+	local weaponName = st and st.WeaponName or Config.Bot.Loadout[1]
+
+	-- 段階1は装備1スロットのみ
+	local maxHealth = Character.MaxHealthForSlots(1)
+	humanoid.MaxHealth = maxHealth
+	humanoid.Health = maxHealth
+
+	applyMovement(humanoid, weaponName)
+	applyJumpCooldown(humanoid)
+
+	return humanoid
+end
+
+--==================================================
+-- 生成（リスポーンは実装しない）
+--==================================================
+function Character.Spawn(player: Player)
+	local st = State.Get(player)
+	if st and not st.Alive then
+		-- 仕様書 12. 禁止事項: リスポーン・蘇生
+		return
+	end
+	player:LoadCharacter()
+end
+
+return Character
+]]></ProtectedString>
+		</Properties>
+	</Item>
+	<Item class="ModuleScript" referent="RBX3">
+		<Properties>
+			<bool name="Disabled">false</bool>
+			<string name="Name">SV_Combat</string>
+			<ProtectedString name="Source"><![CDATA[--!nonstrict
+--[[
+	SV_Combat
+	配置場所: ServerScriptService/SV_Combat
+
+	射撃・ヒット判定・ダメージ確定を担当する。
+
+	【厳守（仕様書 11. 技術前提）】
+	サーバー権威。ダメージ・死亡・得点・勝敗は全てここで確定する。
+	クライアントから受け取ってよいのは照準点のみで、
+	命中判定・ダメージ値・体力値をクライアントから受け取ってはならない。
+
+	【厳守（仕様書 12. 禁止事項）】
+	射撃による自滅を発生させない。
+	残り体力が使用コストを下回る場合、その武器は発射不可とする。
+]]
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local Config = require(ReplicatedStorage:WaitForChild("GameConfig"))
+local Net = require(script.Parent.SV_Net)
+local State = require(script.Parent.SV_State)
+local Character = require(script.Parent.SV_Character)
+
+local Combat = {}
+
+local RE_Notify_Hit   = Net.Get("RE_Notify_Hit")
+local RE_Notify_Shot  = Net.Get("RE_Notify_Shot")
+local RE_Notify_Death = Net.Get("RE_Notify_Death")
+local RE_Sync_State   = Net.Get("RE_Sync_State")
+
+-- 段階3（得点集計）から接続するためのフック。ここでは得点計算を行わない
+local killedBindable = Instance.new("BindableEvent")
+Combat.Killed = killedBindable.Event
+
+--==================================================
+-- 状態同期（サーバー → クライアント）
+--==================================================
+function Combat.Sync(player: Player)
+	local st = State.Get(player)
+	if not st then return end
+
+	local humanoid = Combat.GetHumanoid(player)
+	local now = os.clock()
+
+	RE_Sync_State:FireClient(player, {
+		Health    = humanoid and humanoid.Health or 0,
+		MaxHealth = humanoid and humanoid.MaxHealth or 0,
+		Ammo      = st.Ammo,
+		Reserve   = st.Reserve,
+		Reloading = now < st.ReloadingUntil,
+		ReloadEndsAt = st.ReloadingUntil,
+		Bleeding  = now < st.BleedUntil,
+		Weapon    = st.WeaponName,
+		Alive     = st.Alive,
+	})
+end
+
+function Combat.GetHumanoid(player: Player): Humanoid?
+	local character = player.Character
+	if not character then return nil end
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	if not humanoid or humanoid.Health <= 0 then return nil end
+	return humanoid
+end
+
+--==================================================
+-- 拡散の適用
+--==================================================
+-- 空中時の実効拡散 = SpreadDeg / (1 - Airborne.AccuracyPenalty)
+-- 仕様書 7.「命中精度 -30%」をサーバー側で確定させる
+local function applySpread(direction: Vector3, spreadDeg: number): Vector3
+	if spreadDeg <= 0 then
+		return direction
+	end
+	local maxAngle = math.rad(spreadDeg)
+	-- 円内一様分布にするため sqrt を掛ける
+	local angle = maxAngle * math.sqrt(math.random())
+	local roll  = math.random() * math.pi * 2
+	local base  = CFrame.lookAt(Vector3.zero, direction)
+	return (base * CFrame.Angles(0, 0, roll) * CFrame.Angles(angle, 0, 0)).LookVector
+end
+
+--==================================================
+-- ダメージ確定
+--==================================================
+function Combat.ApplyDamage(victim: Player, attacker: Player?, amount: number, isBleed: boolean)
+	local st = State.Get(victim)
+	if not st or not st.Alive then return end
+
+	local humanoid = Combat.GetHumanoid(victim)
+	if not humanoid then return end
+
+	local attackerId = attacker and attacker.UserId or nil
+	State.LogDamage(st, attackerId, amount)
+
+	if not isBleed then
+		st.LastAttackerId = attackerId
+	end
+	st.DiedByBleed = isBleed
+
+	humanoid.Health = math.max(0, humanoid.Health - amount)
+
+	-- 継続ダメージ（段階1.7）
+	-- 被弾のたびに更新。体力15以下では新規付与しない
+	if Config.Bleed.Enabled and not isBleed then
+		if humanoid.Health > Config.Bleed.MinHPFloor then
+			local now = os.clock()
+			st.BleedUntil = now + Config.Bleed.DurationSec
+			st.BleedNextTickAt = now + 1
+		end
+	end
+
+	Combat.Sync(victim)
+end
+
+--==================================================
+-- 死亡処理
+--==================================================
+function Combat.OnDeath(victim: Player)
+	local st = State.Get(victim)
+	if not st or not st.Alive then return end
+
+	st.Alive = false
+	st.BleedUntil = 0
+
+	-- 撃破点の帰属（仕様書 1.）
+	--   通常: 止めを刺した者（LastHit）
+	--   継続ダメージによる死亡: 最も多くダメージを与えた者
+	local creditId: number?
+	if st.DiedByBleed and Config.Scoring.BleedDeathCredit == "MostDamage" then
+		creditId = State.MostDamageId(st)
+	else
+		creditId = st.LastAttackerId
+	end
+
+	-- 自滅・場外は誰にも入らない
+	if creditId == victim.UserId then
+		creditId = nil
+	end
+
+	local killer = creditId and Players:GetPlayerByUserId(creditId) or nil
+
+	-- 得点集計は段階3。ここでは事実の確定のみを行う
+	killedBindable:Fire(victim, killer, st.DiedByBleed)
+
+	RE_Notify_Death:FireAllClients({
+		VictimId = victim.UserId,
+		KillerId = creditId,
+		ByBleed  = st.DiedByBleed,
+	})
+
+	Combat.Sync(victim)
+end
+
+--==================================================
+-- 射撃
+--==================================================
+function Combat.TryFire(player: Player, aimPoint: Vector3)
+	local st = State.Get(player)
+	if not st or not st.Alive then return end
+
+	local humanoid = Combat.GetHumanoid(player)
+	if not humanoid then return end
+
+	local character = player.Character
+	local head = character and character:FindFirstChild(Config.Combat.HeadPartName)
+	if not head then return end
+
+	local weapon = Config.Weapons[st.WeaponName]
+	if not weapon then return end
+
+	local now = os.clock()
+
+	-- リロード中は撃てない
+	if now < st.ReloadingUntil then return end
+
+	-- 連射間隔（サーバー側で検証する。クライアントの申告は信用しない）
+	local interval = 60 / weapon.RPM
+	if now - st.LastFireAt < interval * Config.Combat.FireRateTolerance then return end
+
+	-- 弾薬（補給なし・拾得なし）
+	if st.Ammo <= 0 then return end
+
+	-- 使用コスト。体力が足りなければ発射しない（自滅させない）
+	local cost = weapon.UseCostHP or 0
+	if Config.Health.BlockWhenInsufficientHP then
+		if humanoid.Health - cost < Config.Health.MinHPToAct then
+			return
+		end
+	end
+
+	-- 照準点の妥当性検証
+	if typeof(aimPoint) ~= "Vector3" then return end
+	local origin = head.Position
+	local delta = aimPoint - origin
+	if delta.Magnitude < 0.01 then return end
+	if delta.Magnitude > Config.M(Config.Combat.MaxAimDistanceM) then
+		delta = delta.Unit * Config.M(Config.Combat.MaxAimDistanceM)
+	end
+
+	-- 消費を確定
+	st.LastFireAt = now
+	st.Ammo -= 1
+	if cost > 0 then
+		humanoid.Health = math.max(Config.Health.MinHPToAct, humanoid.Health - cost)
+	end
+
+	-- 拡散（空中なら精度低下）
+	local spreadDeg = weapon.SpreadDeg or 0
+	if Character.IsAirborne(humanoid) then
+		spreadDeg = spreadDeg / (1 - Config.Airborne.AccuracyPenalty)
+	end
+	local direction = applySpread(delta.Unit, spreadDeg)
+
+	-- レイキャスト（射程は実効射程で打ち切る）
+	local range = Config.M(weapon.RangeEffectiveM)
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { character }
+	params.IgnoreWater = true
+
+	local result = workspace:Raycast(origin, direction * range, params)
+	local endPoint = result and result.Position or (origin + direction * range)
+
+	-- 曳光弾の描画用。命中判定の結果ではなく見た目のためだけに送る
+	RE_Notify_Shot:FireAllClients(origin, endPoint, player.UserId)
+
+	if result then
+		local hitPart = result.Instance
+		local hitCharacter = hitPart:FindFirstAncestorOfClass("Model")
+		local hitHumanoid = hitCharacter and hitCharacter:FindFirstChildOfClass("Humanoid")
+
+		if hitHumanoid and hitHumanoid.Health > 0 then
+			local victim = Players:GetPlayerFromCharacter(hitCharacter)
+			local isHead = hitPart.Name == Config.Combat.HeadPartName
+			local damage = weapon.DamageBody * (isHead and (weapon.HeadshotMul or 1) or 1)
+
+			if victim then
+				Combat.ApplyDamage(victim, player, damage, false)
+			else
+				-- Bot（段階2）用。Player に紐づかない Humanoid にも通す
+				hitHumanoid.Health = math.max(0, hitHumanoid.Health - damage)
+			end
+
+			RE_Notify_Hit:FireClient(player, isHead)
+		end
+	end
+
+	Combat.Sync(player)
+end
+
+--==================================================
+-- リロード
+--==================================================
+function Combat.TryReload(player: Player)
+	local st = State.Get(player)
+	if not st or not st.Alive then return end
+
+	local weapon = Config.Weapons[st.WeaponName]
+	if not weapon or not weapon.MagSize then return end
+
+	local now = os.clock()
+	if now < st.ReloadingUntil then return end
+	if st.Ammo >= weapon.MagSize then return end
+	if st.Reserve <= 0 then return end
+
+	local token = now + weapon.ReloadSec
+	st.ReloadingUntil = token
+	Combat.Sync(player)
+
+	task.delay(weapon.ReloadSec, function()
+		-- 切替を挟んだ場合はリロードをやり直す（段階4.5で切替実装時に判定を追加する）
+		local cur = State.Get(player)
+		if not cur or not cur.Alive then return end
+		-- 別のリロードで上書きされていたら、この完了処理は破棄する
+		if cur.ReloadingUntil ~= token then return end
+
+		local need = weapon.MagSize - cur.Ammo
+		local take = math.min(need, cur.Reserve)
+		cur.Ammo += take
+		cur.Reserve -= take
+		cur.ReloadingUntil = 0
+		Combat.Sync(player)
+	end)
+end
+
+return Combat
+]]></ProtectedString>
+		</Properties>
+	</Item>
+	<Item class="ModuleScript" referent="RBX4">
+		<Properties>
+			<bool name="Disabled">false</bool>
+			<string name="Name">SV_Bleed</string>
+			<ProtectedString name="Source"><![CDATA[--!nonstrict
+--[[
+	SV_Bleed
+	配置場所: ServerScriptService/SV_Bleed
+
+	継続ダメージ（段階1.7）
+
+	仕様書 2.:
+		被弾時、毎秒1ダメージを3秒間。被弾のたびに更新
+		最大累計3ダメージ
+		体力15以下では停止する（反撃不能のスパイラルを防ぐ）
+]]
+
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local Config = require(ReplicatedStorage:WaitForChild("GameConfig"))
+local State = require(script.Parent.SV_State)
+local Combat = require(script.Parent.SV_Combat)
+
+local Bleed = {}
+
+function Bleed.Start()
+	if not Config.Bleed.Enabled then
+		return
+	end
+
+	RunService.Heartbeat:Connect(function()
+		local now = os.clock()
+
+		for player, st in pairs(State.All()) do
+			if st.Alive and st.BleedUntil > now and now >= st.BleedNextTickAt then
+				local humanoid = Combat.GetHumanoid(player)
+
+				if not humanoid then
+					st.BleedUntil = 0
+				elseif humanoid.Health <= Config.Bleed.MinHPFloor then
+					-- 反撃不能のスパイラルを防ぐため、ここで打ち切る
+					st.BleedUntil = 0
+					Combat.Sync(player)
+				else
+					st.BleedNextTickAt = now + 1
+
+					-- 継続ダメージによる死亡は最多ダメージ者に帰属させるため
+					-- 攻撃者を指定せず、DamageLog の集計に委ねる
+					Combat.ApplyDamage(player, nil, Config.Bleed.DamagePerSec, true)
+				end
+			end
+		end
+	end)
+end
+
+return Bleed
+]]></ProtectedString>
+		</Properties>
+	</Item>
+	<Item class="ModuleScript" referent="RBX5">
+		<Properties>
+			<bool name="Disabled">false</bool>
+			<string name="Name">SV_TestArena</string>
+			<ProtectedString name="Source"><![CDATA[--!nonstrict
+--[[
+	SV_TestArena
+	配置場所: ServerScriptService/SV_TestArena
+
+	段階1の検証専用アリーナ。本番マップではない。
+
+	目的:
+		1. 移動速度・ジャンプ高が体感と合っているかを確かめる
+		2. 高さ基準（MapStandards）どおりに「越えられる/越えられない」が機能するか
+		3. 長射線で射程の打ち切りが機能するか
+
+	全ての寸法は GameConfig を参照する。ここに数値を直書きしないこと。
+]]
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Config = require(ReplicatedStorage:WaitForChild("GameConfig"))
+
+local Arena = {}
+
+local M = Config.M
+
+local function newPart(name: string, size: Vector3, cframe: CFrame, color: Color3, parent: Instance): Part
+	local part = Instance.new("Part")
+	part.Name = name
+	part.Size = size
+	part.CFrame = cframe
+	part.Anchored = true
+	part.TopSurface = Enum.SurfaceType.Smooth
+	part.BottomSurface = Enum.SurfaceType.Smooth
+	part.Color = color
+	part.Material = Enum.Material.SmoothPlastic
+	part.Parent = parent
+	return part
+end
+
+--==================================================
+-- 床
+--==================================================
+local function buildFloor(parent: Instance)
+	local diameter = M(Config.TestArena.FloorDiameterM)
+	local floor = newPart(
+		"Floor",
+		Vector3.new(diameter, M(1), diameter),
+		CFrame.new(0, -M(0.5), 0),
+		Color3.fromRGB(80, 84, 88),
+		parent
+	)
+	floor.Shape = Enum.PartType.Cylinder
+	-- Cylinder は X 軸方向が高さになるため回転させる
+	floor.Size = Vector3.new(M(1), diameter, diameter)
+	floor.CFrame = CFrame.new(0, -M(0.5), 0) * CFrame.Angles(0, 0, math.rad(90))
+end
+
+--==================================================
+-- スポーン地点
+--==================================================
+-- 段階1では中立スポーン。チーム分けは段階3で行う
+local function buildSpawns(parent: Instance)
+	local radius = M(Config.Map.SpawnRadiusM)
+	local count = Config.Map.SpawnCount
+
+	for i = 1, count do
+		local angle = (i - 1) * (math.pi * 2 / count)
+		local pos = Vector3.new(math.cos(angle) * radius, M(0.5), math.sin(angle) * radius)
+
+		local spawn = Instance.new("SpawnLocation")
+		spawn.Name = ("Spawn_%d"):format(i)
+		spawn.Size = Vector3.new(M(2), M(0.2), M(2))
+		spawn.CFrame = CFrame.new(pos)
+		spawn.Anchored = true
+		spawn.Neutral = true
+		spawn.Duration = 0 -- ForceField を出さない（1試合1命のため無意味）
+		spawn.Color = Color3.fromRGB(120, 140, 160)
+		spawn.Parent = parent
+	end
+end
+
+--==================================================
+-- 遮蔽物
+--==================================================
+-- 高さ基準の検証用に3種類を並べる:
+--   CoverCrouchM  1.1m しゃがんで隠れる
+--   CoverStandM   1.8m 立って隠れる／ジャンプ(1.9m)で越えられる
+--   WallSolidM    2.2m 越えられない
+local function buildCovers(parent: Instance)
+	local heights = {
+		{ h = Config.MapStandards.CoverCrouchM, color = Color3.fromRGB(120, 160, 120) },
+		{ h = Config.MapStandards.CoverStandM,  color = Color3.fromRGB(160, 150, 110) },
+		{ h = Config.MapStandards.WallSolidM,   color = Color3.fromRGB(170, 110, 110) },
+	}
+
+	local count = Config.TestArena.CoverCount
+	local radius = M(Config.Map.CenterZoneM)
+
+	for i = 1, count do
+		local angle = (i - 1) * (math.pi * 2 / count)
+		local spec = heights[((i - 1) % #heights) + 1]
+		local height = M(spec.h)
+
+		newPart(
+			("Cover_%d_%.1fm"):format(i, spec.h),
+			Vector3.new(M(4.0), height, M(0.6)),
+			CFrame.new(math.cos(angle) * radius, height / 2, math.sin(angle) * radius)
+				* CFrame.Angles(0, -angle, 0),
+			spec.color,
+			parent
+		)
+	end
+end
+
+--==================================================
+-- 長射線
+--==================================================
+-- 仕様書 4.「マップ側には長射線を2〜3本必ず用意する（選択肢の存在保証）」
+-- 対面スポーン間 = 約70m = スナイパー実効射程。ここでは射線を塞がないだけ
+local function buildSightlineMarkers(parent: Instance)
+	if not Config.TestArena.LongSightlines then
+		return
+	end
+
+	local radius = M(Config.Map.SpawnRadiusM)
+	for i = 1, Config.Map.LongSightlines do
+		local angle = (i - 1) * (math.pi / Config.Map.LongSightlines)
+		local marker = newPart(
+			("Sightline_%d"):format(i),
+			Vector3.new(radius * 2, M(0.05), M(0.4)),
+			CFrame.new(0, M(0.03), 0) * CFrame.Angles(0, angle, 0),
+			Color3.fromRGB(200, 190, 120),
+			parent
+		)
+		marker.CanCollide = false
+		marker.Transparency = 0.5
+	end
+end
+
+--==================================================
+-- 境界（見えない壁）
+--==================================================
+-- 仕様書 9.「見えない壁で物理的に阻む（退場システムは実装しない）」
+local function buildBoundary(parent: Instance)
+	if Config.Boundary.Method ~= "InvisibleWall" then
+		return
+	end
+
+	local radius = M(Config.TestArena.FloorDiameterM) / 2
+	local height = M(Config.MapStandards.FloorHeightM * 3)
+	local segments = 24
+	local segWidth = (2 * math.pi * radius) / segments * 1.1
+
+	for i = 1, segments do
+		local angle = (i - 1) * (math.pi * 2 / segments)
+		local wall = newPart(
+			("Boundary_%d"):format(i),
+			Vector3.new(segWidth, height, M(0.5)),
+			CFrame.new(math.cos(angle) * radius, height / 2, math.sin(angle) * radius)
+				* CFrame.Angles(0, -angle + math.pi / 2, 0),
+			Color3.fromRGB(255, 255, 255),
+			parent
+		)
+		wall.Transparency = 1
+		wall.CanCollide = true
+	end
+end
+
+--==================================================
+-- Studio 初期状態の片付け
+--==================================================
+-- 新規プレイスに最初から入っている Baseplate と SpawnLocation を消す。
+-- 残しておくと、こちらのスポーン地点と競合してプレイヤーが
+-- 中央に湧いてしまう。手作業で消させないためにコード側で処理する。
+local function clearDefaults(keep: Instance)
+	for _, child in ipairs(workspace:GetChildren()) do
+		if child == keep then
+			continue
+		end
+		if child.Name == "Baseplate" and child:IsA("BasePart") then
+			child:Destroy()
+		elseif child:IsA("SpawnLocation") then
+			child:Destroy()
+		end
+	end
+end
+
+function Arena.Build()
+	if not Config.TestArena.Enabled then
+		return
+	end
+
+	local existing = workspace:FindFirstChild("TestArena")
+	if existing then
+		existing:Destroy()
+	end
+
+	local folder = Instance.new("Folder")
+	folder.Name = "TestArena"
+	folder.Parent = workspace
+
+	clearDefaults(folder)
+
+	buildFloor(folder)
+	buildSpawns(folder)
+	buildCovers(folder)
+	buildSightlineMarkers(folder)
+	buildBoundary(folder)
+end
+
+return Arena
+]]></ProtectedString>
+		</Properties>
+	</Item>
+	<Item class="Script" referent="RBX6">
+		<Properties>
+			<bool name="Disabled">false</bool>
+			<string name="Name">SV_Main</string>
+			<ProtectedString name="Source"><![CDATA[--!nonstrict
+--[[
+	SV_Main
+	配置場所: ServerScriptService/SV_Main
+
+	段階1 / 1.5 / 1.7 の起動処理。
+
+	実装済み:
+		段階1   移動・射撃・ヒット判定（武器1種のみ = Assault）
+		段階1.5 体力消費型の射撃
+		段階1.7 継続ダメージ
+
+	未実装（実装順序を飛ばさないこと）:
+		段階2  Bot
+		段階3  チーム分け・得点集計・終了判定
+		段階4  レーダーUI
+		段階4.5 ライン切替（汎用処理として実装する）
+]]
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local Config    = require(ReplicatedStorage:WaitForChild("GameConfig"))
+local Net       = require(script.Parent.SV_Net)
+local State     = require(script.Parent.SV_State)
+local Character = require(script.Parent.SV_Character)
+local Combat    = require(script.Parent.SV_Combat)
+local Bleed     = require(script.Parent.SV_Bleed)
+local Arena     = require(script.Parent.SV_TestArena)
+
+-- 段階1で使用する唯一の武器
+local STAGE1_WEAPON = "Assault"
+
+--==================================================
+-- 起動
+--==================================================
+-- リスポーンは実装しない。生成はサーバーが1回だけ行う。
+-- 誰かが参加する前に必ず切っておくこと
+Players.CharacterAutoLoads = false
+
+Arena.Build()
+Bleed.Start()
+
+--==================================================
+-- 入力の受信（意思のみ）
+--==================================================
+Net.Get("RE_Fire_Weapon").OnServerEvent:Connect(function(player, aimPoint)
+	Combat.TryFire(player, aimPoint)
+end)
+
+Net.Get("RE_Reload_Weapon").OnServerEvent:Connect(function(player)
+	Combat.TryReload(player)
+end)
+
+--==================================================
+-- プレイヤー
+--==================================================
+local function onCharacterAdded(player: Player, character: Model)
+	local humanoid = Character.Setup(player, character)
+
+	humanoid.Died:Connect(function()
+		Combat.OnDeath(player)
+	end)
+
+	Combat.Sync(player)
+end
+
+local function onPlayerAdded(player: Player)
+	State.Create(player, STAGE1_WEAPON)
+
+	player.CharacterAdded:Connect(function(character)
+		onCharacterAdded(player, character)
+	end)
+
+	Character.Spawn(player)
+end
+
+Players.PlayerAdded:Connect(onPlayerAdded)
+for _, player in ipairs(Players:GetPlayers()) do
+	task.spawn(onPlayerAdded, player)
+end
+
+Players.PlayerRemoving:Connect(function(player)
+	State.Remove(player)
+end)
+
+--==================================================
+-- 撃破の記録（得点集計は段階3で実装する）
+--==================================================
+Combat.Killed:Connect(function(victim, killer, byBleed)
+	if killer then
+		print(("[KILL] %s -> %s%s"):format(
+			killer.Name, victim.Name, byBleed and " (継続ダメージ)" or ""))
+	else
+		print(("[DEATH] %s (帰属なし)"):format(victim.Name))
+	end
+end)
+]]></ProtectedString>
+		</Properties>
+	</Item>
+</roblox>
