@@ -694,6 +694,32 @@ local function newPart(name: string, size: Vector3, cframe: CFrame, color: Color
 end
 
 --==================================================
+-- 不可視キャップ
+--==================================================
+-- 越えられない壁の上に、見えない当たり判定を積む。
+-- 高さが足りていても上に乗れる場所が無くなるため、助走で越えられなくなる。
+--
+-- CanQuery = false が必須。true にすると弾が見えない壁に当たり、
+-- 遮蔽の高さが実質的に変わってしまう（射線を切る役割が壊れる）。
+local function addNoMountCap(wall: BasePart)
+	local capHeight = M(Config.MapStandards.SolidWallCapM)
+	if capHeight <= 0 then
+		return
+	end
+
+	local cap = Instance.new("Part")
+	cap.Name = wall.Name .. "_Cap"
+	cap.Size = Vector3.new(wall.Size.X, capHeight, wall.Size.Z)
+	cap.CFrame = wall.CFrame * CFrame.new(0, (wall.Size.Y + capHeight) / 2, 0)
+	cap.Anchored = true
+	cap.Transparency = 1
+	cap.CanCollide = true
+	cap.CanQuery = false -- 弾は通す
+	cap.CanTouch = false
+	cap.Parent = wall.Parent
+end
+
+--==================================================
 -- 床
 --==================================================
 local function buildFloor(parent: Instance)
@@ -744,9 +770,9 @@ end
 --   WallSolidM    2.2m 越えられない
 local function buildCovers(parent: Instance)
 	local heights = {
-		{ h = Config.MapStandards.CoverCrouchM, color = Color3.fromRGB(120, 160, 120) },
-		{ h = Config.MapStandards.CoverStandM,  color = Color3.fromRGB(160, 150, 110) },
-		{ h = Config.MapStandards.WallSolidM,   color = Color3.fromRGB(170, 110, 110) },
+		{ h = Config.MapStandards.CoverCrouchM, color = Color3.fromRGB(120, 160, 120), solid = false },
+		{ h = Config.MapStandards.CoverStandM,  color = Color3.fromRGB(160, 150, 110), solid = false },
+		{ h = Config.MapStandards.WallSolidM,   color = Color3.fromRGB(170, 110, 110), solid = true  },
 	}
 
 	local count = Config.TestArena.CoverCount
@@ -757,7 +783,7 @@ local function buildCovers(parent: Instance)
 		local spec = heights[((i - 1) % #heights) + 1]
 		local height = M(spec.h)
 
-		newPart(
+		local wall = newPart(
 			("Cover_%d_%.1fm"):format(i, spec.h),
 			Vector3.new(M(4.0), height, M(0.6)),
 			CFrame.new(math.cos(angle) * radius, height / 2, math.sin(angle) * radius)
@@ -765,6 +791,61 @@ local function buildCovers(parent: Instance)
 			spec.color,
 			parent
 		)
+
+		-- 越えられない壁にはキャップを付ける。付けないと助走で乗り上げられる
+		if spec.solid then
+			addNoMountCap(wall)
+		end
+	end
+end
+
+--==================================================
+-- 高さ検証台
+--==================================================
+-- 「何mまでなら助走で越えられるか」を実測するための設備。
+-- ここの壁にはキャップを付けない。素の挙動を測るのが目的のため。
+local function buildHeightProbe(parent: Instance)
+	local probe = Config.TestArena.HeightProbe
+	if not probe.Enabled then
+		return
+	end
+
+	local count = #probe.HeightsM
+	local spacing = M(probe.SpacingM)
+	local startX = -spacing * (count - 1) / 2
+	local z = M(probe.OffsetM)
+
+	for i, heightM in ipairs(probe.HeightsM) do
+		local height = M(heightM)
+		local vaultable = heightM <= Config.MapStandards.WallVaultableM
+
+		local wall = newPart(
+			("Probe_%.1fm"):format(heightM),
+			Vector3.new(M(probe.WidthM), height, M(probe.ThicknessM)),
+			CFrame.new(startX + spacing * (i - 1), height / 2, z),
+			vaultable
+				and Color3.fromRGB(160, 150, 110)
+				or Color3.fromRGB(170, 110, 110),
+			parent
+		)
+
+		-- 高さを頭上に表示する。どれを試しているか分からなくなるため
+		local billboard = Instance.new("BillboardGui")
+		billboard.Name = "HeightLabel"
+		billboard.Size = UDim2.new(0, 90, 0, 30)
+		billboard.StudsOffsetWorldSpace = Vector3.new(0, M(0.7), 0)
+		billboard.AlwaysOnTop = true
+		billboard.Parent = wall
+
+		local text = Instance.new("TextLabel")
+		text.Size = UDim2.new(1, 0, 1, 0)
+		text.BackgroundTransparency = 1
+		text.Font = Enum.Font.GothamBold
+		text.TextScaled = true
+		text.Text = ("%.1fm"):format(heightM)
+		text.TextColor3 = Color3.fromRGB(255, 255, 255)
+		text.TextStrokeTransparency = 0.2
+		text.Parent = billboard
 	end
 end
 
@@ -860,6 +941,7 @@ function Arena.Build()
 	buildFloor(folder)
 	buildSpawns(folder)
 	buildCovers(folder)
+	buildHeightProbe(folder)
 	buildSightlineMarkers(folder)
 	buildBoundary(folder)
 end
